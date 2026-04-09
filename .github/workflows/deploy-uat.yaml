@@ -1,0 +1,149 @@
+name: Deploy UAT
+
+# Triggered on merge to the `uat` branch.
+#
+# GUARD RAIL: every commit being pushed to `uat` must already exist on `dev`.
+# This enforces the promotion path: changes land on dev first, then are
+# cherry-picked (or fast-forwarded) to uat. A direct push to uat that
+# bypasses dev will fail this check and the deploy will not run.
+
+on:
+  push:
+    branches:
+      - uat
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-uat
+  cancel-in-progress: false
+
+jobs:
+  lineage-guard:
+    name: Verify commit lineage (uat commits must exist on dev)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch dev branch
+        run: git fetch origin dev:refs/remotes/origin/dev
+
+      - name: Check every pushed commit exists on dev
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA:  ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          # On workflow_dispatch there's no push range — check HEAD only.
+          if [[ -z "${BEFORE_SHA:-}" || "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
+            commits="$(git rev-parse HEAD)"
+          else
+            commits="$(git rev-list "${BEFORE_SHA}..${AFTER_SHA}")"
+          fi
+
+          if [[ -z "$commits" ]]; then
+            echo "No new commits to check."
+            exit 0
+          fi
+
+          missing=()
+          for sha in $commits; do
+            if git merge-base --is-ancestor "$sha" origin/dev; then
+              echo "ok   $sha is on origin/dev"
+            else
+              echo "FAIL $sha is NOT on origin/dev"
+              missing+=("$sha")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            {
+              echo "## Lineage guard FAILED"
+              echo ""
+              echo "The following commits were pushed to \`uat\` but do not exist on \`dev\`:"
+              for sha in "${missing[@]}"; do
+                echo "- \`$sha\`"
+              done
+              echo ""
+              echo "Promotion path is DEV → UAT → PROD. Land the change on \`dev\` first."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+  deploy:
+    name: Apply DDL to Snowflake UAT
+    needs: lineage-guard
+    runs-on: ubuntu-latest
+    environment: uat
+    env:
+      TARGET_ENV: UAT
+      SNOWFLAKE_ACCOUNT:   ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER:      ${{ secrets.SNOWFLAKE_UAT_USER }}
+      SNOWFLAKE_ROLE:      ${{ secrets.SNOWFLAKE_UAT_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_UAT_WAREHOUSE }}
+      SNOWFLAKE_DATABASE:  ${{ secrets.SNOWFLAKE_UAT_DATABASE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Snowflake private key to disk
+        run: |
+          mkdir -p "$RUNNER_TEMP/sf"
+          echo "${{ secrets.SNOWFLAKE_UAT_PRIVATE_KEY }}" > "$RUNNER_TEMP/sf/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/sf/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/sf/rsa_key.p8" >> "$GITHUB_ENV"
+
+      - name: Generate DDL from live Snowflake state
+        run: |
+          python -m engine.generate_ddl \
+            --env "$TARGET_ENV" \
+            --output-root output/ddl \
+            | tee engine.log
+
+      - name: Liquibase status
+        uses: liquibase-github-actions/[email protected]
+        with:
+          operation: "status"
+          changelogFile: "liquibase/changelog-master.xml"
+          url: "jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}"
+          username: ${{ env.SNOWFLAKE_USER }}
+
+      - name: Liquibase update
+        uses: liquibase-github-actions/[email protected]
+        with:
+          changelogFile: "liquibase/changelog-master.xml"
+          url: "jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}"
+          username: ${{ env.SNOWFLAKE_USER }}
+
+      - name: Post deploy summary
+        if: always()
+        run: |
+          {
+            echo "## UAT deploy summary"
+            echo ""
+            echo "Commit: \`${{ github.sha }}\`"
+            echo ""
+            echo "### Engine output"
+            echo '```'
+            grep -E "^\[engine\]" engine.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Shred private key
+        if: always()
+        run: shred -u "$RUNNER_TEMP/sf/rsa_key.p8" || rm -f "$RUNNER_TEMP/sf/rsa_key.p8"

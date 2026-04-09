@@ -1,0 +1,89 @@
+name: Deploy DEV
+
+# Triggered on merge to the `dev` branch.
+# Runs the engine with LIVE Snowflake state read, then applies via Liquibase.
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Apply DDL to Snowflake DEV
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      TARGET_ENV: DEV
+      SNOWFLAKE_ACCOUNT:   ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER:      ${{ secrets.SNOWFLAKE_DEV_USER }}
+      SNOWFLAKE_ROLE:      ${{ secrets.SNOWFLAKE_DEV_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_DEV_WAREHOUSE }}
+      SNOWFLAKE_DATABASE:  ${{ secrets.SNOWFLAKE_DEV_DATABASE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Snowflake private key to disk
+        run: |
+          mkdir -p "$RUNNER_TEMP/sf"
+          echo "${{ secrets.SNOWFLAKE_DEV_PRIVATE_KEY }}" > "$RUNNER_TEMP/sf/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/sf/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/sf/rsa_key.p8" >> "$GITHUB_ENV"
+
+      - name: Generate DDL from live Snowflake state
+        run: |
+          python -m engine.generate_ddl \
+            --env "$TARGET_ENV" \
+            --output-root output/ddl \
+            | tee engine.log
+
+      - name: Set up Liquibase
+        uses: liquibase-github-actions/[email protected]
+        with:
+          operation: "status"
+          changelogFile: "liquibase/changelog-master.xml"
+          url: "jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}"
+          username: ${{ env.SNOWFLAKE_USER }}
+
+      - name: Liquibase update
+        uses: liquibase-github-actions/[email protected]
+        with:
+          changelogFile: "liquibase/changelog-master.xml"
+          url: "jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}"
+          username: ${{ env.SNOWFLAKE_USER }}
+
+      - name: Post deploy summary
+        if: always()
+        run: |
+          {
+            echo "## DEV deploy summary"
+            echo ""
+            echo "Commit: \`${{ github.sha }}\`"
+            echo ""
+            echo "### Engine output"
+            echo '```'
+            grep -E "^\[engine\]" engine.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Shred private key
+        if: always()
+        run: shred -u "$RUNNER_TEMP/sf/rsa_key.p8" || rm -f "$RUNNER_TEMP/sf/rsa_key.p8"
