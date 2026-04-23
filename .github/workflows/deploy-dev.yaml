@@ -20,11 +20,11 @@ jobs:
     environment: dev
     env:
       TARGET_ENV: DEV
-      SNOWFLAKE_ACCOUNT:   ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      SNOWFLAKE_USER:      ${{ secrets.SNOWFLAKE_DEV_USER }}
-      SNOWFLAKE_ROLE:      ${{ secrets.SNOWFLAKE_DEV_ROLE }}
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_DEV_USER }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_DEV_ROLE }}
       SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_DEV_WAREHOUSE }}
-      SNOWFLAKE_DATABASE:  ${{ secrets.SNOWFLAKE_DEV_DATABASE }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DEV_DATABASE }}
 
     steps:
       - name: Checkout
@@ -56,19 +56,24 @@ jobs:
             | tee engine.log
 
       - name: Set up Liquibase
-        uses: liquibase-github-actions/[email protected]
+        uses: liquibase/setup-liquibase@v2
         with:
-          operation: "status"
-          changelogFile: "liquibase/changelog-master.xml"
-          url: "jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}"
-          username: ${{ env.SNOWFLAKE_USER }}
+          version: "4.32.0"
+          edition: "community"
+
+      - name: Liquibase status
+        run: |
+          liquibase status \
+            --changelog-file=liquibase/changelog-master.xml \
+            --url="jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}" \
+            --username=${{ env.SNOWFLAKE_USER }}
 
       - name: Liquibase update
-        uses: liquibase-github-actions/[email protected]
-        with:
-          changelogFile: "liquibase/changelog-master.xml"
-          url: "jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}"
-          username: ${{ env.SNOWFLAKE_USER }}
+        run: |
+          liquibase update \
+            --changelog-file=liquibase/changelog-master.xml \
+            --url="jdbc:snowflake://${{ env.SNOWFLAKE_ACCOUNT }}.snowflakecomputing.com/?db=${{ env.SNOWFLAKE_DATABASE }}&warehouse=${{ env.SNOWFLAKE_WAREHOUSE }}&role=${{ env.SNOWFLAKE_ROLE }}&authenticator=SNOWFLAKE_JWT&private_key_file=${{ env.SNOWFLAKE_PRIVATE_KEY_PATH }}" \
+            --username=${{ env.SNOWFLAKE_USER }}
 
       - name: Post deploy summary
         if: always()
