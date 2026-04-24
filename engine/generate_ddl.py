@@ -46,6 +46,14 @@ CREATE_ORDER = [
     "task",
 ]
 
+# FQN suffixes for infrastructure/system tables that should never be
+# flagged as drift. These are created by tools (e.g. Liquibase) and are
+# not managed through bundles.
+IGNORED_OBJECT_SUFFIXES = {
+    "DATABASECHANGELOG",
+    "DATABASECHANGELOGLOCK",
+}
+
 # Execution order for drops (reverse dependency order)
 DROP_ORDER = [
     "task",
@@ -78,6 +86,9 @@ class Changeset:
             attrs.append("runOnChange:true")
         attrs.append(f"labels:{self.object_type},{self.operation}")
         attrs.append(f"context:{self.operation}")
+        if "$$" in self.sql:
+            attrs.append("splitStatements:false")
+            attrs.append("endDelimiter:")
         if attrs:
             header += " " + " ".join(attrs)
         header += f"\n--comment {self.operation.upper()} {self.object_type} {self.fqn}"
@@ -123,8 +134,17 @@ def compute_changesets(
     bundles: list[Bundle],
     existing: dict[str, ExistingObject],
     author: str = "engine",
+    liquibase_tracked: set[str] | None = None,
 ) -> list[Changeset]:
-    """Compute the ordered list of changesets to apply."""
+    """Compute the ordered list of changesets to apply.
+
+    Args:
+        liquibase_tracked: FQNs that were deployed via Liquibase. If provided,
+            only objects in this set can trigger breaking-change drops. Objects
+            in 'existing' but NOT in this set are assumed manually created and
+            are silently skipped. When None (offline / tests), all existing
+            objects are considered tracked (backwards-compatible behavior).
+    """
     desired = _collect_desired(bundles)
     confirmed_drops = _all_confirmed_drops(bundles)
     changesets: list[Changeset] = []
@@ -249,6 +269,13 @@ def compute_changesets(
         if fqn in desired:
             continue
 
+        if ex_obj.name.upper() in IGNORED_OBJECT_SUFFIXES:
+            continue
+
+        # Skip objects not tracked by Liquibase (manually created in DB)
+        if liquibase_tracked is not None and fqn not in liquibase_tracked:
+            continue
+
         if ex_obj.object_type in BREAKING_DROP_TYPES:
             if fqn not in confirmed_drops:
                 unconfirmed_breaking.append(f"{ex_obj.object_type.upper()} {fqn}")
@@ -307,6 +334,7 @@ def compute_changesets(
 def write_changesets(changesets: list[Changeset], output_root: Path) -> Path:
     """Write one .sql file per logical group and a master changelog."""
     output_root.mkdir(parents=True, exist_ok=True)
+    print(f"[engine] Output directory (absolute): {output_root.resolve()}")
     changesets_dir = output_root / "changesets"
     changesets_dir.mkdir(exist_ok=True)
 
@@ -347,6 +375,7 @@ def write_changesets(changesets: list[Changeset], output_root: Path) -> Path:
                 master.append(f'  <include file="{f}" relativeToChangelogFile="true"/>')
     master.append("</databaseChangeLog>")
     master_path.write_text("\n".join(master) + "\n")
+    print(f"[engine] Master changelog (absolute): {master_path.resolve()}")
 
     return master_path
 
@@ -372,37 +401,39 @@ def main() -> int:
     for b in bundles:
         print(f"         - {b.name}: {len(b.objects)} object(s)")
 
+    liquibase_tracked: set[str] | None = None
+
     if args.offline:
         print("[engine] OFFLINE mode: assuming no existing objects in Snowflake")
         existing: dict[str, ExistingObject] = {}
     else:
         print("[engine] Reading current Snowflake state...")
         reader = SnowflakeStateReader.from_env(args.env)
-        # All bundles in the current model share a single per-env database
-        # (DEV_FS_DB / UAT_FS_DB / PROD_FS_DB), so this set will have one
-        # element. The set comprehension is intentional, not redundant — it
-        # keeps the engine working if a future bundle ever points at a
-        # secondary database (e.g. a dedicated sandbox or shared-data DB).
         databases = {b.database for b in bundles}
         existing = {}
+        liquibase_tracked = set()
         for db in databases:
             print(f"[engine]   scanning database {db}")
             existing.update(reader.read_database(db))
-        print(f"[engine]   found {len(existing)} existing object(s)")
+            tracked = reader.read_liquibase_tracked_fqns(db)
+            liquibase_tracked.update(tracked)
+            print(f"[engine]   found {len(tracked)} Liquibase-tracked object(s) in {db}")
+        print(f"[engine]   found {len(existing)} existing object(s) total")
+        print(f"[engine]   {len(existing) - len(liquibase_tracked)} manually created (will be ignored for drop safety)")
 
     print("[engine] Computing changesets...")
     try:
-        changesets = compute_changesets(bundles, existing)
+        changesets = compute_changesets(bundles, existing, liquibase_tracked=liquibase_tracked)
     except DropSafetyError as e:
         print(str(e), file=sys.stderr)
         return 2
 
-    if not changesets:
-        print("[engine] No changes required. Exiting.")
-        return 0
-
     print(f"[engine] Writing {len(changesets)} changeset(s) to {args.output_root}")
     master = write_changesets(changesets, args.output_root)
+
+    if not changesets:
+        print("[engine] No changes required. Empty changelog written for pipeline compatibility.")
+        return 0
     print(f"[engine] Master changelog: {master}")
 
     # Print summary

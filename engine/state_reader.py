@@ -51,7 +51,10 @@ class SnowflakeStateReader:
         conn = snowflake.connector.connect(
             account=os.environ["SNOWFLAKE_ACCOUNT"],
             user=os.environ["SNOWFLAKE_USER"],
-            private_key=_load_private_key(os.environ["SNOWFLAKE_PRIVATE_KEY"]),
+            private_key=_load_private_key(
+                os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH")
+                or os.environ["SNOWFLAKE_PRIVATE_KEY"]
+            ),
             role=os.environ.get("SNOWFLAKE_ROLE", f"ROLE_{env.upper()}_ADMIN"),
             warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", f"WH_{env.upper()}_XS"),
         )
@@ -190,6 +193,34 @@ class SnowflakeStateReader:
             objects[obj.fqn] = obj
 
         return objects
+
+
+    def read_liquibase_tracked_fqns(self, database: str) -> set[str]:
+        """Return FQNs of objects that were deployed through Liquibase.
+
+        Reads the DATABASECHANGELOG table (in the LIQUIBASE schema) and parses
+        the COMMENTS column. Engine-generated comments follow the format:
+            CREATE table DEV_FS_DB.BRONZE.RAW_ORDERS
+        We extract the third token (the FQN) from each comment.
+
+        Objects found in Snowflake but NOT in this set were created manually
+        and should not trigger breaking-change errors.
+        """
+        fqns: set[str] = set()
+        try:
+            rows = self._query(
+                f"SELECT COMMENTS FROM {database}.LIQUIBASE.DATABASECHANGELOG "
+                f"WHERE AUTHOR = 'engine' AND COMMENTS IS NOT NULL"
+            )
+            for (comment,) in rows:
+                parts = comment.strip().split()
+                if len(parts) >= 3:
+                    fqn = parts[-1].upper()
+                    if fqn.count(".") == 2:
+                        fqns.add(fqn)
+        except Exception:
+            pass
+        return fqns
 
 
 def _load_private_key(pem_or_path: str):

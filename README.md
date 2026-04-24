@@ -2,8 +2,6 @@
 
 Config-driven Snowflake DDL platform. You describe what you want in `bundle.yaml` files and CSV schemas; the engine diffs that against live Snowflake state and emits Liquibase-compatible changesets; Liquibase applies them via CI.
 
-> DBT handles transformations (DML only, no DDL). SODA handles data quality. Airflow orchestrates. This repo owns structure: databases, schemas, tables, views, streams, tasks, stored procs, dynamic tables, stages, file formats.
-
 ---
 
 ## Repository layout
